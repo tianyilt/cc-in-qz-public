@@ -1,0 +1,18 @@
+#!/bin/sh
+# activate - Source this to add ccc to PATH in the current shell
+# Usage: source ./activate
+#
+# After sourcing, `ccc` command is available immediately.
+
+CC_SETUP_BIN="$(cd "$(dirname "$0")" && pwd)"
+
+case ":${PATH}:" in
+  *":$CC_SETUP_BIN:"*)
+    # Already in PATH
+    ;;
+  *)
+    export PATH="$CC_SETUP_BIN:$PATH"
+    ;;
+esac
+
+echo "ccc activated. Run: ccc"

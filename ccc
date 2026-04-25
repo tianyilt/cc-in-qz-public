@@ -1,0 +1,231 @@
+#!/bin/sh
+# ccc - Claude Code launcher (POSIX sh compatible)
+# Supports providers: zai (default), local, openrouter
+#
+# Usage: ccc [provider] [--model MODEL] [claude-code-args...]
+#   ccc                    -> zai provider, glm-5.1
+#   ccc glm                -> zai provider, glm-5.1
+#   ccc glm51local         -> local provider, glm-5.1
+#   ccc glm-5.1-w4a8       -> openapi-sj, glm-5.1-w4a8
+#   ccc qwen               -> openrouter provider, qwen3.6-plus
+#   ccc openrouter         -> openrouter provider
+#   ccc --model glm-5.1    -> zai provider, explicit model
+#   ccc --openrouter --model qwen/qwen3.6-plus:free
+#
+# Environment overrides:
+#   CC_DIR          path to Claude Code source tree (default: this script's dir)
+#   CC_SETUP_DIR    path to cc-setup directory (default: same as CC_DIR)
+#   CLAUDE_CONFIG_DIR  path to Claude config (default: ~/.claude)
+#   CC_ENV_FILE     path to personal env file (default: ~/.env.local)
+#   BUN             path to bun binary (default: auto-detect)
+
+# --- Auto-detect paths ---
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CC_DIR="${CC_DIR:-$SCRIPT_DIR}"
+CC_SETUP_DIR="${CC_SETUP_DIR:-$SCRIPT_DIR}"
+CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+export CLAUDE_CONFIG_DIR
+
+# --- Resolve bun: env var, then PATH, then shared bun, then ~/.bun ---
+if [ -z "${BUN:-}" ]; then
+  for candidate in \
+    "$(command -v bun 2>/dev/null)" \
+    "$CC_SETUP_DIR/bun/bun" \
+    "$HOME/.bun/bin/bun"; do
+    if [ -x "$candidate" ]; then
+      BUN="$candidate"
+      break
+    fi
+  done
+fi
+
+if [ -z "$BUN" ]; then
+  echo "Error: bun not found. Install it:" >&2
+  echo "  curl -fsSL https://bun.sh/install | bash" >&2
+  echo "Or set BUN=/path/to/bun" >&2
+  exit 1
+fi
+
+# --- Source API keys: shared env first, then personal override ---
+if [ -f "$CC_SETUP_DIR/share/env.shared.sh" ]; then
+  . "$CC_SETUP_DIR/share/env.shared.sh"
+fi
+
+ENV_FILE="${CC_ENV_FILE:-$HOME/.env.local}"
+if [ -f "$ENV_FILE" ]; then
+  . "$ENV_FILE"
+fi
+
+# --- Parse provider and model ---
+provider="zai"
+model=""
+
+case "$1" in
+  --help|-h|help)
+    echo "Usage: ccc [glm|qwen|openrouter|glm51local|dsv4pro|--zai|--openrouter|--local] [--model MODEL] [claude-code-args...]"
+    echo ""
+    echo "Providers:"
+    echo "  (default)  zai (glm-5.1 via z.ai API)"
+    echo "  glm        zai with glm-5.1"
+    echo "  glm51local local inference (openapi-qb-ai, glm-5.1)"
+    echo "  glm-5.1-w4a8 local inference (openapi-sj, glm-5.1-w4a8)"
+    echo "  dsv4pro    DeepSeek V4 Pro (deepseek-v4-infra, deepseek-ai/DeepSeek-V4-Pro)"
+    echo "  local      local inference (default model glm-5.1)"
+    echo "  qwen       openrouter with qwen3.6-plus:free"
+    echo "  openrouter openrouter (default qwen3.6-plus:free)"
+    echo ""
+    echo "Flags:"
+    echo "  --zai           use zai provider"
+    echo "  --openrouter    use openrouter provider"
+    echo "  --local         use local provider"
+    echo "  --model MODEL   override model name"
+    echo ""
+    echo "Environment:"
+    echo "  CC_DIR          path to Claude Code source (default: this script's dir)"
+    echo "  CC_SETUP_DIR    path to cc-setup (default: same as CC_DIR)"
+    echo "  CLAUDE_CONFIG_DIR  path to config (default: ~/.claude)"
+    echo "  CC_ENV_FILE     path to personal env file (default: ~/.env.local)"
+    echo "  BUN             path to bun binary"
+    exit 0
+    ;;
+  dsv4pro|deepseek-v4-pro)
+    provider="dsv4pro"
+    model="deepseek-ai/DeepSeek-V4-Pro"
+    shift
+    ;;
+  glm-5.1-w4a8)
+    provider="glm51local"
+    model="glm-5.1-w4a8"
+    shift
+    ;;
+  glm51local|local)
+    provider="local"
+    model="glm-5.1"
+    shift
+    ;;
+  --local)
+    provider="local"
+    shift
+    ;;
+  glm|glm-5.1)
+    provider="zai"
+    model="glm-5.1"
+    shift
+    ;;
+  qwen|qwen3|qwenplus)
+    provider="openrouter"
+    model="qwen/qwen3.6-plus:free"
+    shift
+    ;;
+  openrouter)
+    provider="openrouter"
+    shift
+    ;;
+  --zai)
+    provider="zai"
+    shift
+    ;;
+  --openrouter|--or)
+    provider="openrouter"
+    shift
+    ;;
+esac
+
+if [ "$1" = "--model" ]; then
+  if [ -z "$2" ]; then
+    echo "Error: --model requires an argument" >&2
+    exit 1
+  fi
+  model="$2"
+  shift 2
+fi
+
+# --- Launch with provider config ---
+case "$provider" in
+  zai)
+    zai_api_key="${ZAI_API_KEY:-${ANTHROPIC_AUTH_TOKEN:-}}"
+    if [ -z "$zai_api_key" ]; then
+      echo "Error: ZAI_API_KEY or ANTHROPIC_AUTH_TOKEN not set." >&2
+      echo "Source from $CC_SETUP_DIR/share/env.shared.sh or ~/.env.local" >&2
+      exit 1
+    fi
+    model="${model:-glm-5.1}"
+    cd "$CC_DIR" && \
+      ANTHROPIC_AUTH_TOKEN="$zai_api_key" \
+      ANTHROPIC_BASE_URL="https://YOUR_ZAI_ENDPOINT" \
+      ANTHROPIC_MODEL="$model" \
+      ANTHROPIC_DEFAULT_OPUS_MODEL="glm-5.1" \
+      ANTHROPIC_DEFAULT_SONNET_MODEL="glm-5.1" \
+      ANTHROPIC_DEFAULT_HAIKU_MODEL="glm-4.5-air" \
+      API_TIMEOUT_MS="3000000" \
+      "$BUN" run ./src/dev-entry.ts "$@"
+    ;;
+  glm51local)
+    inf_api_key="${INF_API_KEY:-}"
+    if [ -z "$inf_api_key" ]; then
+      echo "Error: INF_API_KEY not set." >&2
+      echo "Source from $CC_SETUP_DIR/share/env.shared.sh or ~/.env.local" >&2
+      exit 1
+    fi
+    model="${model:-glm-5.1-w4a8}"
+    cd "$CC_DIR" && \
+      OPENAI_API_KEY="$inf_api_key" \
+      OPENAI_BASE_URL="https://YOUR_OPENAPI_SJ_ENDPOINT/v1" \
+      OPENAI_CONTEXT_WINDOW="202752" \
+      ANTHROPIC_MODEL="$model" \
+      API_TIMEOUT_MS="3000000" \
+      "$BUN" run ./src/dev-entry.ts "$@"
+    ;;
+  dsv4pro)
+    inf_api_key="${INF_API_KEY:-}"
+    if [ -z "$inf_api_key" ]; then
+      echo "Error: INF_API_KEY not set." >&2
+      echo "Source from $CC_SETUP_DIR/share/env.shared.sh or ~/.env.local" >&2
+      exit 1
+    fi
+    model="${model:-deepseek-ai/DeepSeek-V4-Pro}"
+    cd "$CC_DIR" && \
+      OPENAI_API_KEY="$inf_api_key" \
+      OPENAI_BASE_URL="https://YOUR_DEEPSEEK_ENDPOINT/v1" \
+      OPENAI_CONTEXT_WINDOW="1048576" \
+      ANTHROPIC_MODEL="$model" \
+      API_TIMEOUT_MS="3000000" \
+      "$BUN" run ./src/dev-entry.ts "$@"
+    ;;
+  local)
+    inf_api_key="${INF_API_KEY:-}"
+    inf_base_url="${INF_BASE_URL:-https://YOUR_OPENAPI_QB_ENDPOINT}"
+    if [ -z "$inf_api_key" ]; then
+      echo "Error: INF_API_KEY not set." >&2
+      echo "Source from $CC_SETUP_DIR/share/env.shared.sh or ~/.env.local" >&2
+      exit 1
+    fi
+    model="${model:-glm-5.1}"
+    cd "$CC_DIR" && \
+      OPENAI_API_KEY="$inf_api_key" \
+      OPENAI_BASE_URL="$inf_base_url/v1" \
+      OPENAI_CONTEXT_WINDOW="202752" \
+      ANTHROPIC_MODEL="$model" \
+      API_TIMEOUT_MS="3000000" \
+      "$BUN" run ./src/dev-entry.ts "$@"
+    ;;
+  openrouter)
+    openrouter_api_key="${OPENROUTER_API_KEY:-}"
+    if [ -z "$openrouter_api_key" ]; then
+      echo "Error: OPENROUTER_API_KEY not set." >&2
+      echo "Add it to ~/.env.local or set CC_ENV_FILE." >&2
+      exit 1
+    fi
+    model="${model:-qwen/qwen3.6-plus:free}"
+    cd "$CC_DIR" && \
+      OPENAI_API_KEY="$openrouter_api_key" \
+      OPENAI_BASE_URL="https://openrouter.ai/api/v1" \
+      ANTHROPIC_MODEL="$model" \
+      API_TIMEOUT_MS="3000000" \
+      "$BUN" run ./src/dev-entry.ts "$@"
+    ;;
+  *)
+    echo "Error: Unknown provider '$provider'" >&2
+    exit 1
+    ;;
+esac

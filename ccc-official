@@ -1,0 +1,171 @@
+#!/bin/sh
+# ccc-official - Launch official Claude Code with custom model providers
+# Supports: glm51local (openapi-qb-ai), glm-5.1-w4a8 (openapi-sj), dsv4pro (deepseek-v4-infra)
+#
+# Usage: ccc-official <provider> [claude-code-args...]
+#   ccc-official glm51local        -> local glm-5.1 via openapi-qb-ai
+#   ccc-official glm-5.1-w4a8      -> glm-5.1-w4a8 via openapi-sj
+#   ccc-official dsv4pro           -> DeepSeek V4 Pro via deepseek-v4-infra
+#   ccc-official zai               -> glm-5.1 via z.ai (Anthropic-compatible, no proxy needed)
+
+CC_SETUP_DIR="/inspire/ssd/project/video-generation/public/openveo3/tools/cc-setup"
+CLAUDE_CONFIG_DIR="$CC_SETUP_DIR/claude-config"
+export CLAUDE_CONFIG_DIR
+PROXY_SCRIPT="$CC_SETUP_DIR/bin/anthropic-openai-proxy.ts"
+CLAUDE_BIN="$CC_SETUP_DIR/bin/claude-official"
+
+# --- Resolve bun ---
+BUN=""
+for candidate in \
+  "$CC_SETUP_DIR/bun/bun" \
+  "$(command -v bun 2>/dev/null)" \
+  "$HOME/.bun/bin/bun"; do
+  if [ -x "$candidate" ]; then
+    BUN="$candidate"
+    break
+  fi
+done
+
+if [ -z "$BUN" ]; then
+  echo "Error: bun not found." >&2
+  exit 1
+fi
+
+# --- Source API keys ---
+if [ -f "$CC_SETUP_DIR/share/env.shared.sh" ]; then
+  . "$CC_SETUP_DIR/share/env.shared.sh"
+fi
+
+ENV_FILE="${CC_ENV_FILE:-$HOME/.env.local}"
+if [ -f "$ENV_FILE" ]; then
+  . "$ENV_FILE"
+fi
+
+# --- Parse provider ---
+provider="$1"
+shift 2>/dev/null
+
+case "$provider" in
+  glm51local|local)
+    OPENAI_API_KEY="${INF_API_KEY:-}"
+    OPENAI_BASE_URL="https://YOUR_OPENAPI_QB_ENDPOINT/v1"
+    OPENAI_CONTEXT_WINDOW="202752"
+    MODEL="glm-5.1"
+    ;;
+  dsv4pro|deepseek-v4-pro)
+    OPENAI_API_KEY="${INF_API_KEY:-}"
+    OPENAI_BASE_URL="https://YOUR_DEEPSEEK_ENDPOINT/v1"
+    OPENAI_CONTEXT_WINDOW="1048576"
+    MODEL="deepseek-ai/DeepSeek-V4-Pro"
+    ;;
+  glm-5.1-w4a8)
+    OPENAI_API_KEY="${INF_API_KEY:-}"
+    OPENAI_BASE_URL="https://YOUR_OPENAPI_SJ_ENDPOINT/v1"
+    OPENAI_CONTEXT_WINDOW="202752"
+    MODEL="glm-5.1-w4a8"
+    ;;
+  zai)
+    # z.ai is Anthropic-compatible, no proxy needed
+    zai_api_key="${ZAI_API_KEY:-${ANTHROPIC_AUTH_TOKEN:-}}"
+    if [ -z "$zai_api_key" ]; then
+      echo "Error: ZAI_API_KEY not set." >&2
+      exit 1
+    fi
+    if [ ! -x "$CLAUDE_BIN" ]; then
+      echo "Error: Official Claude Code binary not found at $CLAUDE_BIN" >&2
+      echo "Run init-cc.sh to install it." >&2
+      exit 1
+    fi
+    exec env \
+      CLAUDE_CONFIG_DIR="$CLAUDE_CONFIG_DIR" \
+      ANTHROPIC_AUTH_TOKEN="$zai_api_key" \
+      ANTHROPIC_BASE_URL="https://YOUR_ZAI_ENDPOINT" \
+      ANTHROPIC_MODEL="glm-5.1" \
+      API_TIMEOUT_MS="3000000" \
+      "$CLAUDE_BIN" --model glm-5.1 "$@"
+    ;;
+  --help|-h|help)
+    echo "Usage: ccc-official <provider> [claude-code-args...]"
+    echo ""
+    echo "Providers (require Anthropic-to-OpenAI proxy):"
+    echo "  glm51local     glm-5.1 via openapi-qb-ai (local inference)"
+    echo "  glm-5.1-w4a8   glm-5.1-w4a8 via openapi-sj (local inference)"
+    echo "  dsv4pro        DeepSeek V4 Pro via deepseek-v4-infra"
+    echo ""
+    echo "Providers (Anthropic-compatible, no proxy):"
+    echo "  zai            glm-5.1 via z.ai API"
+    echo ""
+    echo "The proxy starts automatically and shuts down when Claude Code exits."
+    exit 0
+    ;;
+  *)
+    echo "Error: Unknown provider '$provider'" >&2
+    echo "Usage: ccc-official <glm51local|glm-5.1-w4a8|dsv4pro|zai> [claude-code-args...]" >&2
+    exit 1
+    ;;
+esac
+
+if [ -z "$OPENAI_API_KEY" ]; then
+  echo "Error: INF_API_KEY not set." >&2
+  echo "Shared keys should be in $CC_SETUP_DIR/share/env.shared.sh" >&2
+  exit 1
+fi
+
+if [ ! -x "$CLAUDE_BIN" ]; then
+  echo "Error: Official Claude Code binary not found at $CLAUDE_BIN" >&2
+  echo "Run init-cc.sh to install it." >&2
+  exit 1
+fi
+
+# --- Cleanup handler ---
+PROXY_PID=""
+PORT_FILE="/tmp/anthropic-proxy-$$.port"
+PROXY_LOG="/tmp/anthropic-proxy-$$.log"
+
+cleanup() {
+  if [ -n "$PROXY_PID" ]; then
+    kill $PROXY_PID 2>/dev/null
+    wait $PROXY_PID 2>/dev/null
+  fi
+  rm -f "$PORT_FILE" "$PROXY_LOG"
+}
+
+exit_code=0
+trap cleanup EXIT INT TERM HUP
+
+# --- Start proxy in background ---
+OPENAI_API_KEY="$OPENAI_API_KEY" \
+OPENAI_BASE_URL="$OPENAI_BASE_URL" \
+OPENAI_CONTEXT_WINDOW="$OPENAI_CONTEXT_WINDOW" \
+DEFAULT_MODEL="$MODEL" \
+"$BUN" run "$PROXY_SCRIPT" --port-file "$PORT_FILE" 0 > "$PROXY_LOG" 2>&1 &
+PROXY_PID=$!
+
+# Wait for proxy to be ready (port file + health check)
+for i in $(seq 1 50); do
+  if [ -f "$PORT_FILE" ] && curl -s "http://localhost:$(cat "$PORT_FILE" 2>/dev/null)/health" > /dev/null 2>&1; then
+    break
+  fi
+  sleep 0.2
+done
+
+PROXY_PORT=$(cat "$PORT_FILE" 2>/dev/null)
+if [ -z "$PROXY_PORT" ]; then
+  echo "Error: Proxy failed to start. See $PROXY_LOG" >&2
+  cat "$PROXY_LOG" >&2
+  exit 1
+fi
+
+echo "[ccc-official] Proxy on localhost:$PROXY_PORT (PID $PROXY_PID), upstream: $OPENAI_BASE_URL, model: $MODEL"
+
+# --- Launch official Claude Code ---
+CLAUDE_CONFIG_DIR="$CLAUDE_CONFIG_DIR" \
+ANTHROPIC_BASE_URL="http://localhost:$PROXY_PORT" \
+ANTHROPIC_API_KEY="dummy-key-for-proxy" \
+ANTHROPIC_MODEL="$MODEL" \
+CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1 \
+API_TIMEOUT_MS="3000000" \
+"$CLAUDE_BIN" --model "$MODEL" "$@"
+exit_code=$?
+
+exit $exit_code
